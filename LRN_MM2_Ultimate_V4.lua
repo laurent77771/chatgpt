@@ -1,22 +1,17 @@
 --[[
-    LRN MM2 ULTIMATE V4
+    LRN MM2 ULTIMATE V6 - SURVIVAL & ROLE KIT
     Modern UI / Mobile Friendly / Safer Cleanup
 
     Main features:
-    - Role ESP (Murderer / Sheriff / Innocent)
-    - Gun Drop ESP
-    - Trap ESP
-    - Tracers (Drawing API when supported)
-    - Proximity radar
-    - Sheriff silent aim hook
-    - Custom hitbox expander with original-property restore
-    - Noclip
-    - WalkSpeed / JumpPower presets
-    - Coin farm tween
-    - Gun teleport / Sky safe spot
-    - FullBright + restore
-    - Animated modern UI, mobile drag, responsive scale
-    - Toast notifications and live status card
+    - Survival awareness alert for nearby players in line of sight
+    - Coin Route Assistant: marks one nearby, visible coin only
+    - No auto movement / no teleport / no wall clipping for coin guidance
+    - Optional practice crosshair
+    - Manual practice timer (not tied to the game's actual cooldown)
+    - Sheriff / Murderer / Innocent strategy tips
+    - Own-role status card, using only role data available to the local client
+    - Mobile-friendly UI, clean unload, and restore helpers
+    - Legacy auto-aim, hitbox, noclip, and auto-farm controls retired from the UI
 ]]
 
 --==============================================================
@@ -82,12 +77,17 @@ local State = {
     CurrentTab = "Visuals",
     IsUnloaded = false,
 
-    RoleESP = true,
-    GunESP = true,
-    TrapESP = true,
+    RoleESP = false,
+    RoleAlerts = false,
+    GunESP = false,
+    TrapESP = false,
     Tracers = false,
     ProximityRadar = true,
-    AutoAim = true,
+    CoinRouteAssist = false,
+    PracticeCrosshair = false,
+    PracticeTimerRunning = false,
+    PracticeTimerUntil = 0,
+    AutoAim = false,
     AutoAimSmooth = 0.28,
     AimFOV = 260,
     AimPrediction = 0.08,
@@ -112,6 +112,7 @@ local Cache = {
     OriginalParts = setmetatable({}, { __mode = "k" }),
     Role = {},
     RoleStamp = {},
+    RoleAnnounced = {},
 }
 
 local OriginalLighting = {
@@ -130,6 +131,7 @@ local RoleColors = {
     Innocent = Color3.fromRGB(75, 220, 145),
     GunDrop  = Color3.fromRGB(255, 220, 75),
     Trap     = Color3.fromRGB(255, 140, 70),
+    Unknown  = Color3.fromRGB(170, 178, 195),
 }
 
 local UI = {}
@@ -141,6 +143,8 @@ local lastTrapScan = 0
 local ProximityAlertLabel = nil
 local StatusRoleLabel = nil
 local StatusInfoLabel = nil
+local updateProximity, updateCoinRouteAssist, clearCoinRouteMarker
+local showRoleTips, startPracticeTimer, updateStatusUI
 
 local HasDrawing = (typeof(Drawing) == "table" and typeof(Drawing.new) == "function")
 
@@ -316,21 +320,43 @@ local function readRoleAttributes(plr)
     return nil
 end
 
+local function cacheRole(plr, role, stamp)
+    Cache.Role[plr] = role
+    Cache.RoleStamp[plr] = stamp
+
+    -- Alerts only fire when the client actually exposes a role signal.
+    -- Unknown is deliberately not treated as Innocent.
+    if State.RoleAlerts and (role == "Murderer" or role == "Sheriff" or role == "Hero")
+        and Cache.RoleAnnounced[plr] ~= role then
+        Cache.RoleAnnounced[plr] = role
+        local isSelf = plr == LocalPlayer
+        local playerName = isSelf and "YOU" or (plr.DisplayName or plr.Name)
+        local message
+        if isSelf then
+            message = "YOUR ROLE  •  " .. role:upper()
+        else
+            message = "ROLE FOUND  •  " .. role:upper() .. "  •  " .. playerName
+        end
+        notify(message, RoleColors[role])
+    end
+
+    return role
+end
+
 local function getRole(plr, force)
     if not plr then
-        return "Innocent"
+        return "Unknown"
     end
 
     local stamp = os.clock()
-    if not force and Cache.Role[plr] and Cache.RoleStamp[plr] and stamp - Cache.RoleStamp[plr] < 0.35 then
+    if not force and Cache.Role[plr] and Cache.RoleStamp[plr]
+        and stamp - Cache.RoleStamp[plr] < 0.35 then
         return Cache.Role[plr]
     end
 
     local direct = readRoleAttributes(plr)
     if direct then
-        Cache.Role[plr] = direct
-        Cache.RoleStamp[plr] = stamp
-        return direct
+        return cacheRole(plr, direct, stamp)
     end
 
     local char = plr.Character
@@ -351,23 +377,17 @@ local function getRole(plr, force)
 
     for _, name in ipairs(toolNames) do
         if name:find("knife") or name:find("blade") or name:find("slash") or name:find("dagger") then
-            Cache.Role[plr] = "Murderer"
-            Cache.RoleStamp[plr] = stamp
-            return "Murderer"
+            return cacheRole(plr, "Murderer", stamp)
         end
     end
 
     for _, name in ipairs(toolNames) do
         if name:find("gun") or name:find("revolver") or name:find("pistol") or name:find("sheriff") then
-            Cache.Role[plr] = "Sheriff"
-            Cache.RoleStamp[plr] = stamp
-            return "Sheriff"
+            return cacheRole(plr, "Sheriff", stamp)
         end
     end
 
-    Cache.Role[plr] = "Innocent"
-    Cache.RoleStamp[plr] = stamp
-    return "Innocent"
+    return cacheRole(plr, "Unknown", stamp)
 end
 
 local function getMurdererPlayer()
@@ -471,7 +491,7 @@ local function createPlayerESP(plr)
     removePlayerESP(plr)
 
     local role = getRole(plr)
-    local color = RoleColors[role] or RoleColors.Innocent
+    local color = RoleColors[role] or RoleColors.Unknown
 
     local highlight = Instance.new("Highlight")
     highlight.Name = "LRN3_PlayerHighlight"
@@ -799,7 +819,7 @@ local function applyHitbox(plr)
     if not char then return end
 
     local role = getRole(plr)
-    local color = RoleColors[role] or RoleColors.Innocent
+    local color = RoleColors[role] or RoleColors.Unknown
     local parts = {
         char:FindFirstChild("HumanoidRootPart"),
         char:FindFirstChild("UpperTorso"),
@@ -1019,13 +1039,15 @@ if not uiHost then
     uiHost = LocalPlayer:WaitForChild("PlayerGui")
 end
 
-local oldGui = uiHost:FindFirstChild("LRN_MM2_ULTIMATE_V4")
-if oldGui then
-    pcall(function() oldGui:Destroy() end)
+for _, oldName in ipairs({ "LRN_MM2_ULTIMATE_V4", "LRN_MM2_ULTIMATE_V5", "LRN_MM2_ULTIMATE_V6" }) do
+    local oldGui = uiHost:FindFirstChild(oldName)
+    if oldGui then
+        pcall(function() oldGui:Destroy() end)
+    end
 end
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "LRN_MM2_ULTIMATE_V4"
+ScreenGui.Name = "LRN_MM2_ULTIMATE_V6"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset = true
@@ -1085,6 +1107,39 @@ alertLabel.ZIndex = 91
 alertLabel.Parent = alert
 ProximityAlertFrame = alert
 ProximityAlertLabel = alertLabel
+
+-- Optional center crosshair for manual aim practice (no target locking).
+local CrosshairLabel = Instance.new("TextLabel")
+CrosshairLabel.Name = "PracticeCrosshair"
+CrosshairLabel.Size = UDim2.new(0, 28, 0, 28)
+CrosshairLabel.Position = UDim2.new(0.5, -14, 0.5, -14)
+CrosshairLabel.BackgroundTransparency = 1
+CrosshairLabel.Text = "+"
+CrosshairLabel.TextColor3 = Color3.fromRGB(245, 248, 255)
+CrosshairLabel.TextStrokeTransparency = 0.25
+CrosshairLabel.TextSize = 20
+CrosshairLabel.Font = Enum.Font.GothamBold
+CrosshairLabel.Visible = false
+CrosshairLabel.ZIndex = 120
+CrosshairLabel.Parent = ScreenGui
+
+local PracticeTimerLabel = Instance.new("TextLabel")
+PracticeTimerLabel.Name = "PracticeTimerLabel"
+PracticeTimerLabel.Size = UDim2.new(0, 190, 0, 24)
+PracticeTimerLabel.Position = UDim2.new(0.5, -95, 1, -72)
+PracticeTimerLabel.BackgroundColor3 = Color3.fromRGB(19, 22, 31)
+PracticeTimerLabel.BackgroundTransparency = 0.08
+PracticeTimerLabel.BorderSizePixel = 0
+PracticeTimerLabel.Text = "PRACTICE TIMER"
+PracticeTimerLabel.TextColor3 = Color3.fromRGB(230, 236, 248)
+PracticeTimerLabel.TextSize = 10
+PracticeTimerLabel.Font = Enum.Font.GothamBold
+PracticeTimerLabel.Visible = false
+PracticeTimerLabel.ZIndex = 120
+PracticeTimerLabel.Parent = ScreenGui
+local PracticeTimerCorner = Instance.new("UICorner")
+PracticeTimerCorner.CornerRadius = UDim.new(0, 8)
+PracticeTimerCorner.Parent = PracticeTimerLabel
 
 -- Floating pill
 local Pill = Instance.new("TextButton")
@@ -1293,7 +1348,7 @@ StatusInfoLabel = Instance.new("TextLabel")
 StatusInfoLabel.Size = UDim2.new(0, 170, 0, 16)
 StatusInfoLabel.Position = UDim2.new(1, -182, 0, 29)
 StatusInfoLabel.BackgroundTransparency = 1
-StatusInfoLabel.Text = "ESP ON  •  AUTO AIM ON"
+StatusInfoLabel.Text = "SURVIVAL KIT ACTIVE"
 StatusInfoLabel.TextColor3 = Color3.fromRGB(132, 143, 166)
 StatusInfoLabel.TextSize = 8
 StatusInfoLabel.Font = Enum.Font.GothamMedium
@@ -1587,170 +1642,101 @@ local function switchTab(tabName)
 end
 
 --==============================================================
--- Build tabs
+-- Build tabs: fair-play awareness and practice helpers
 --==============================================================
-sectionLabel(visualsTab, "PLAYER VISIBILITY")
-createToggle(visualsTab, "Role ESP", "Highlight + live role tag", State.RoleESP, function(on)
-    State.RoleESP = on
-    if on then
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then createPlayerESP(plr) end
-        end
-        notify("Role ESP enabled.", RoleColors.Innocent)
-    else
-        clearAllESP()
-        notify("Role ESP disabled.", Color3.fromRGB(130, 140, 160))
-    end
-end)
-
-createToggle(visualsTab, "Gun Drop ESP", "Track dropped sheriff gun", State.GunESP, function(on)
-    State.GunESP = on
-    updateGunDropESP()
-    notify(on and "Gun ESP enabled." or "Gun ESP disabled.", RoleColors.GunDrop)
-end)
-
-createToggle(visualsTab, "Trap ESP", "Detect trap / mine objects", State.TrapESP, function(on)
-    State.TrapESP = on
-    updateTrapESP(true)
-end)
-
-createToggle(visualsTab, "Tracers", HasDrawing and "Drawing API • role lines" or "Drawing API unavailable", State.Tracers, function(on)
-    State.Tracers = on
-    if not on then clearTracers() end
-end)
-
-createToggle(visualsTab, "Murderer Radar", "Alert when danger is nearby", State.ProximityRadar, function(on)
+sectionLabel(visualsTab, "SURVIVAL AWARENESS")
+createToggle(visualsTab, "Nearby Player Alert", "Line-of-sight warning • no role guessing", State.ProximityRadar, function(on)
     State.ProximityRadar = on
-    if not on and ProximityAlertFrame then
-        ProximityAlertFrame.Visible = false
-    end
+    if not on and ProximityAlertFrame then ProximityAlertFrame.Visible = false end
+    notify(on and "Nearby alert enabled." or "Nearby alert disabled.", Color3.fromRGB(255, 125, 135))
 end)
 
-sectionLabel(combatTab, "TARGETING")
-createToggle(combatTab, "Sheriff Auto Aim", "Camera lock to murderer while holding gun", State.AutoAim, function(on)
-    State.AutoAim = on
-    notify(on and "Sheriff auto aim ON." or "Sheriff auto aim OFF.", RoleColors.Sheriff)
+createToggle(visualsTab, "Coin Route Assistant", "Marks one visible coin • manual movement only", State.CoinRouteAssist, function(on)
+    State.CoinRouteAssist = on
+    if not on then clearCoinRouteMarker() end
+    updateCoinRouteAssist()
+    notify(on and "Coin guide enabled: walk around obstacles." or "Coin guide disabled.", Color3.fromRGB(115, 220, 160))
 end)
 
-createAction(combatTab, "Aim FOV 260", "Target window around screen center", function()
-    State.AimFOV = 260
-    notify("Aim FOV set to 260.", RoleColors.Sheriff)
+createAction(visualsTab, "Survival Tips", "Quick advice based on your own detected role", function()
+    showRoleTips(getRole(LocalPlayer, true))
+end, Color3.fromRGB(255, 115, 125))
+
+createAction(visualsTab, "Escape Checklist", "Cover • exits • avoid dead ends", function()
+    notify("ESCAPE CHECK • Keep an exit in view, use corners for cover, and do not run into dead ends.", Color3.fromRGB(255, 170, 105))
+end, Color3.fromRGB(255, 170, 105))
+
+sectionLabel(combatTab, "SHERIFF PRACTICE")
+createToggle(combatTab, "Practice Crosshair", "Center marker only • no auto aim", State.PracticeCrosshair, function(on)
+    State.PracticeCrosshair = on
+    if CrosshairLabel then CrosshairLabel.Visible = on end
+    notify(on and "Practice crosshair enabled." or "Practice crosshair disabled.", RoleColors.Sheriff)
+end)
+
+createAction(combatTab, "Sheriff Tips", "Manual aim and clear line of sight", function()
+    notify("SHERIFF • Keep distance, wait for a clear line, and aim manually. Avoid firing into a crowd.", RoleColors.Sheriff)
 end, RoleColors.Sheriff)
 
-createAction(combatTab, "Aim FOV 420", "Wider target window", function()
-    State.AimFOV = 420
-    notify("Aim FOV set to 420.", RoleColors.Sheriff)
-end, RoleColors.Sheriff)
+sectionLabel(combatTab, "MURDERER PRACTICE")
+createAction(combatTab, "Murderer Tips", "Use map corners and avoid straight chases", function()
+    notify("MURDERER • Use corners for cover, watch escape routes, and avoid chasing in a straight line.", RoleColors.Murderer)
+end, RoleColors.Murderer)
 
-createToggle(combatTab, "Custom Hitbox", "Expand target parts for easier hits", State.HitboxExpander, function(on)
-    State.HitboxExpander = on
-    if on then
-        for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then applyHitbox(plr) end
-        end
-        notify(string.format("Hitbox: %d studs.", State.HitboxSize), RoleColors.Murderer)
-    else
-        resetAllHitboxes()
-        notify("Original hitboxes restored.", Color3.fromRGB(130, 140, 160))
-    end
-end)
+createAction(combatTab, "Start Practice Timer", "Generic manual timer • not the game's cooldown", function()
+    startPracticeTimer(1.5)
+end, Color3.fromRGB(255, 190, 90))
 
-createAction(combatTab, "Hitbox 8", "Balanced client-side preset", function()
-    State.HitboxSize = 8
-    if State.HitboxExpander then
-        for _, plr in ipairs(Players:GetPlayers()) do applyHitbox(plr) end
-    end
-    notify("Hitbox preset set to 8.", RoleColors.Murderer)
-end, Color3.fromRGB(95, 165, 255))
+sectionLabel(movementTab, "LEGIT SURVIVAL MOVEMENT")
+createAction(movementTab, "Escape Reminder", "Move normally; route around walls and doors", function()
+    notify("MOVE SMART • Use normal movement, cut around corners, and keep an exit route open.", Color3.fromRGB(135, 190, 255))
+end, Color3.fromRGB(135, 190, 255))
 
-createAction(combatTab, "Hitbox 14", "Large client-side preset", function()
-    State.HitboxSize = 14
-    if State.HitboxExpander then
-        for _, plr in ipairs(Players:GetPlayers()) do applyHitbox(plr) end
-    end
-    notify("Hitbox preset set to 14.", RoleColors.Murderer)
-end, Color3.fromRGB(255, 90, 105))
-
-createAction(combatTab, "Restore Hitboxes", "Return parts to saved originals", function()
-    resetAllHitboxes()
-end, Color3.fromRGB(150, 160, 180))
-
-sectionLabel(movementTab, "MOVEMENT")
-createToggle(movementTab, "Noclip", "Disable local character collisions", State.Noclip, function(on)
-    State.Noclip = on
-end)
-
-createAction(movementTab, "WalkSpeed 16", "Normal", function()
+createAction(movementTab, "Reset Movement", "Restore normal WalkSpeed / JumpPower", function()
+    State.Noclip = false
+    State.AutoFarm = false
     State.WalkSpeed = 16
+    State.JumpPower = 50
+    stopFarmTween()
+    setLocalCollision(true)
     updateWalkSpeed()
-end, Color3.fromRGB(130, 145, 165))
-
-createAction(movementTab, "WalkSpeed 35", "Fast", function()
-    State.WalkSpeed = 35
-    updateWalkSpeed()
-end, Color3.fromRGB(90, 170, 255))
-
-createAction(movementTab, "WalkSpeed 55", "Ultra", function()
-    State.WalkSpeed = 55
-    updateWalkSpeed()
-end, Color3.fromRGB(255, 190, 75))
-
-createAction(movementTab, "JumpPower 90", "High jump", function()
-    State.JumpPower = 90
     updateJumpPower()
-end, Color3.fromRGB(130, 220, 160))
+    notify("Normal movement restored.", Color3.fromRGB(145, 220, 170))
+end, Color3.fromRGB(145, 220, 170))
 
-createAction(movementTab, "Reset Movement", "WalkSpeed 16 + JumpPower 50", function()
-    restoreMovement()
-end, Color3.fromRGB(145, 155, 175))
+sectionLabel(utilityTab, "COIN ROUTE")
+createAction(utilityTab, "Refresh Coin Target", "Find another visible coin in line of sight", function()
+    if not State.CoinRouteAssist then
+        notify("Enable Coin Route Assistant in Visuals first.", Color3.fromRGB(150, 165, 190))
+        return
+    end
+    updateCoinRouteAssist()
+    notify("Coin target refreshed. Walk to it manually and go around obstacles.", Color3.fromRGB(115, 220, 160))
+end, Color3.fromRGB(115, 220, 160))
 
-sectionLabel(utilityTab, "FARM / WORLD")
-createToggle(utilityTab, "Auto Farm Coin", "Nearest coin → smooth tween", State.AutoFarm, function(on)
-    State.AutoFarm = on
-    if not on then stopFarmTween() end
-    notify(on and "Coin farm started." or "Coin farm stopped.", Color3.fromRGB(255, 213, 80))
-end)
-
-createAction(utilityTab, "Teleport to Gun", "Jump directly to dropped gun", function()
-    teleportToGun()
-end, RoleColors.GunDrop)
-
-createAction(utilityTab, "Sky Safe Spot", "Move 100 studs upward", function()
-    goToSky()
-end, Color3.fromRGB(120, 180, 255))
-
-createToggle(utilityTab, "FullBright", "Remove fog and boost visibility", State.FullBright, function(on)
+createToggle(utilityTab, "FullBright", "Local lighting adjustment", State.FullBright, function(on)
     setFullBright(on)
 end)
 
 sectionLabel(utilityTab, "SCRIPT")
-createAction(utilityTab, "Refresh Scanner", "Force a role / ESP refresh", function()
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            Cache.Role[plr] = nil
-            Cache.RoleStamp[plr] = nil
-            if State.RoleESP then createPlayerESP(plr) end
-        end
-    end
-    updateGunDropESP()
-    updateTrapESP(true)
-    notify("Scanner refreshed.", Color3.fromRGB(105, 175, 255))
+createAction(utilityTab, "Refresh Helpers", "Refresh nearby alert and coin guide", function()
+    updateProximity()
+    updateCoinRouteAssist()
+    updateStatusUI()
+    notify("Helpers refreshed.", Color3.fromRGB(105, 175, 255))
 end, Color3.fromRGB(105, 175, 255))
 
 createAction(utilityTab, "Unload Cleanly", "Restore changes + destroy UI", function()
-    if API.Unload then
-        API.Unload()
-    end
+    if API.Unload then API.Unload() end
 end, Color3.fromRGB(255, 95, 110))
 
 --==============================================================
 -- Runtime status
 --==============================================================
-local function updateStatusUI()
+updateStatusUI = function()
     if State.IsUnloaded then return end
 
     local myRole = getRole(LocalPlayer, true)
-    local color = RoleColors[myRole] or RoleColors.Innocent
+    local color = RoleColors[myRole] or RoleColors.Unknown
 
     if StatusRoleLabel then
         StatusRoleLabel.Text = "ROLE  •  " .. myRole:upper()
@@ -1759,10 +1745,9 @@ local function updateStatusUI()
 
     if StatusInfoLabel then
         local bits = {}
-        if State.RoleESP then table.insert(bits, "ESP") end
-        if State.AutoAim then table.insert(bits, "AUTO AIM") end
-        if State.Noclip then table.insert(bits, "NC") end
-        if State.AutoFarm then table.insert(bits, "FARM") end
+        if State.PracticeCrosshair then table.insert(bits, "CROSSHAIR") end
+        if State.ProximityRadar then table.insert(bits, "ALERT") end
+        if State.CoinRouteAssist then table.insert(bits, "COIN GUIDE") end
         if #bits == 0 then
             StatusInfoLabel.Text = "STANDBY"
         else
@@ -1771,26 +1756,190 @@ local function updateStatusUI()
     end
 end
 
-local function updateProximity()
+local function hasLineOfSightToCharacter(targetCharacter, targetPosition)
+    local camera = Workspace.CurrentCamera or Camera
+    local origin = camera and camera.CFrame.Position
+    if not origin then return false end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    params.IgnoreWater = true
+
+    local direction = targetPosition - origin
+    local result = Workspace:Raycast(origin, direction, params)
+    if not result then
+        return true
+    end
+    return targetCharacter and result.Instance and result.Instance:IsDescendantOf(targetCharacter) or false
+end
+
+updateProximity = function()
     if not ProximityAlertFrame or State.IsUnloaded or not State.ProximityRadar then
         if ProximityAlertFrame then ProximityAlertFrame.Visible = false end
         return
     end
 
-    local root = getRoot(LocalPlayer.Character)
-    local murderer = getMurdererPlayer()
-    local mroot = murderer and getRoot(murderer.Character)
+    local myRoot = getRoot(LocalPlayer.Character)
+    if not myRoot then
+        ProximityAlertFrame.Visible = false
+        return
+    end
 
-    if root and mroot then
-        local distance = (root.Position - mroot.Position).Magnitude
-        if distance <= 35 then
-            ProximityAlertFrame.Visible = true
-            ProximityAlertLabel.Text = string.format("WARNING  •  %s  •  %d studs", murderer.DisplayName or murderer.Name, math.floor(distance))
-            return
+    local nearestPlayer, nearestRoot, nearestDistance = nil, nil, 28
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlive(plr) then
+            local otherRoot = getRoot(plr.Character)
+            if otherRoot then
+                local distance = (myRoot.Position - otherRoot.Position).Magnitude
+                if distance < nearestDistance and hasLineOfSightToCharacter(plr.Character, otherRoot.Position + Vector3.new(0, 1.25, 0)) then
+                    nearestPlayer, nearestRoot, nearestDistance = plr, otherRoot, distance
+                end
+            end
         end
     end
 
+    if nearestPlayer and nearestRoot then
+        local camera = Workspace.CurrentCamera or Camera
+        local screenPoint, onScreen = camera:WorldToViewportPoint(nearestRoot.Position)
+        local side = "NEARBY"
+        if onScreen then
+            side = screenPoint.X < camera.ViewportSize.X * 0.42 and "LEFT"
+                or (screenPoint.X > camera.ViewportSize.X * 0.58 and "RIGHT" or "AHEAD")
+        end
+        ProximityAlertFrame.Visible = true
+        ProximityAlertLabel.Text = string.format("PLAYER %s  •  %d STUDS", side, math.floor(nearestDistance))
+        return
+    end
+
     ProximityAlertFrame.Visible = false
+end
+
+local CoinRouteBillboard = nil
+local CoinRouteTarget = nil
+
+clearCoinRouteMarker = function()
+    if CoinRouteBillboard then
+        pcall(function() CoinRouteBillboard:Destroy() end)
+    end
+    CoinRouteBillboard = nil
+    CoinRouteTarget = nil
+end
+
+updateCoinRouteAssist = function()
+    if State.IsUnloaded or not State.CoinRouteAssist then
+        clearCoinRouteMarker()
+        return
+    end
+
+    local myRoot = getRoot(LocalPlayer.Character)
+    local camera = Workspace.CurrentCamera or Camera
+    if not myRoot or not camera then
+        clearCoinRouteMarker()
+        return
+    end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { LocalPlayer.Character }
+    params.IgnoreWater = true
+
+    local bestCoin, bestDistance = nil, 80
+    for _, coin in ipairs(getTargetCoins()) do
+        if coin and coin.Parent and coin:IsDescendantOf(Workspace) then
+            local distance = (coin.Position - myRoot.Position).Magnitude
+            if distance < bestDistance then
+                local origin = camera.CFrame.Position
+                local result = Workspace:Raycast(origin, coin.Position - origin, params)
+                -- Only mark the coin if the camera has a clear line to it; never show targets through walls.
+                local visible = (result == nil) or (result.Instance == coin)
+                if visible then
+                    bestCoin, bestDistance = coin, distance
+                end
+            end
+        end
+    end
+
+    if not bestCoin then
+        clearCoinRouteMarker()
+        return
+    end
+
+    if CoinRouteTarget ~= bestCoin or not CoinRouteBillboard or not CoinRouteBillboard.Parent then
+        clearCoinRouteMarker()
+        local billboard = Instance.new("BillboardGui")
+        billboard.Name = "LRN_CoinRouteTarget"
+        billboard.Adornee = bestCoin
+        billboard.Size = UDim2.new(0, 176, 0, 34)
+        billboard.StudsOffset = Vector3.new(0, 2.4, 0)
+        billboard.AlwaysOnTop = false
+        billboard.MaxDistance = 85
+        billboard.LightInfluence = 0
+        billboard.Parent = uiHost
+
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 1, 0)
+        label.BackgroundColor3 = Color3.fromRGB(22, 29, 25)
+        label.BackgroundTransparency = 0.12
+        label.BorderSizePixel = 0
+        label.Text = "NEXT COIN  •  WALK MANUALLY"
+        label.TextColor3 = Color3.fromRGB(150, 245, 190)
+        label.TextSize = 9
+        label.Font = Enum.Font.GothamBold
+        label.Parent = billboard
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 8)
+        corner.Parent = label
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(83, 180, 125)
+        stroke.Thickness = 1
+        stroke.Parent = label
+
+        CoinRouteBillboard = billboard
+        CoinRouteTarget = bestCoin
+    else
+        CoinRouteBillboard.Adornee = bestCoin
+    end
+end
+
+showRoleTips = function(role)
+    role = role or getRole(LocalPlayer, true)
+    if role == "Murderer" then
+        notify("KILLER TIP • Use corners for cover; avoid chasing in a straight line.", RoleColors.Murderer)
+    elseif role == "Sheriff" or role == "Hero" then
+        notify("SHERIFF TIP • Keep a clear line of sight and aim manually before firing.", RoleColors.Sheriff)
+    elseif role == "Innocent" then
+        notify("INNOCENT TIP • Keep exits in view; turn corners and avoid dead ends.", RoleColors.Innocent)
+    else
+        notify("ROLE UNKNOWN • Stay near exits and use cover until your role is clear.", RoleColors.Unknown)
+    end
+end
+
+startPracticeTimer = function(seconds)
+    if State.PracticeTimerRunning then
+        notify("Practice timer is already running.", Color3.fromRGB(150, 165, 190))
+        return
+    end
+    seconds = math.clamp(tonumber(seconds) or 1.5, 0.5, 5)
+    State.PracticeTimerRunning = true
+    State.PracticeTimerUntil = os.clock() + seconds
+    PracticeTimerLabel.Visible = true
+    task.spawn(function()
+        while not State.IsUnloaded and State.PracticeTimerRunning do
+            local remaining = State.PracticeTimerUntil - os.clock()
+            if remaining <= 0 then break end
+            PracticeTimerLabel.Text = string.format("PRACTICE TIMER  •  %.1fs", remaining)
+            task.wait(0.05)
+        end
+        State.PracticeTimerRunning = false
+        if PracticeTimerLabel and PracticeTimerLabel.Parent then
+            PracticeTimerLabel.Text = "PRACTICE READY"
+            task.wait(0.45)
+            if PracticeTimerLabel and PracticeTimerLabel.Parent then
+                PracticeTimerLabel.Visible = false
+            end
+        end
+    end)
 end
 
 --==============================================================
@@ -1940,6 +2089,7 @@ Connections.PlayerRemoving = Players.PlayerRemoving:Connect(function(plr)
     removePlayerESP(plr)
     Cache.Role[plr] = nil
     Cache.RoleStamp[plr] = nil
+    Cache.RoleAnnounced[plr] = nil
     if PlayerConnections[plr] then
         pcall(function() PlayerConnections[plr]:Disconnect() end)
         PlayerConnections[plr] = nil
@@ -1976,7 +2126,7 @@ task.spawn(function()
                         createPlayerESP(plr)
                     else
                         local role = getRole(plr)
-                        local color = RoleColors[role] or RoleColors.Innocent
+                        local color = RoleColors[role] or RoleColors.Unknown
                         data.Highlight.FillColor = color
                         data.Highlight.OutlineColor = color:Lerp(Color3.new(1,1,1), 0.65)
                         if data.RoleText then
@@ -1992,9 +2142,10 @@ task.spawn(function()
             end
         end
 
-        updateGunDropESP()
-        updateTrapESP()
+        if State.GunESP then updateGunDropESP() end
+        if State.TrapESP then updateTrapESP() end
         updateProximity()
+        updateCoinRouteAssist()
         updateStatusUI()
         task.wait(0.55)
     end
@@ -2028,6 +2179,11 @@ function API.Unload()
     State.AutoAim = false
     State.HitboxExpander = false
     State.Tracers = false
+    State.CoinRouteAssist = false
+    State.PracticeCrosshair = false
+    State.PracticeTimerRunning = false
+    if CrosshairLabel then CrosshairLabel.Visible = false end
+    clearCoinRouteMarker()
     stopFarmTween()
 
     resetAllHitboxes()
@@ -2057,7 +2213,7 @@ function API.Unload()
         GlobalEnv.LRN_MM2_ULTIMATE = nil
     end
 
-    print("[LRN] MM2 Ultimate V4 unloaded cleanly.")
+    print("[LRN] MM2 Ultimate V6 unloaded cleanly.")
 end
 
 API.State = State
@@ -2077,6 +2233,6 @@ switchTab("Visuals")
 updateScale()
 updateWalkSpeed()
 updateJumpPower()
-notify("V4 loaded • mobile compact UI", Color3.fromRGB(95, 165, 255))
+notify("V6 loaded • Survival & Role Kit", Color3.fromRGB(95, 165, 255))
 
-print("[LRN] MM2 Ultimate V4 ready.")
+print("[LRN] MM2 Ultimate V6 ready.")
