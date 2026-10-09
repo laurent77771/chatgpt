@@ -1,22 +1,19 @@
 --[[
-    LRN MM2 ULTIMATE V4
-    Modern UI / Mobile Friendly / Safer Cleanup
+    LRN MM2 ULTIMATE V3.2 (FIXED & FULL ENHANCED)
+    Modern UI / Mobile Friendly / High Performance & Full Feature Set
 
-    Main features:
-    - Role ESP (Murderer / Sheriff / Innocent)
-    - Gun Drop ESP
-    - Trap ESP
-    - Tracers (Drawing API when supported)
-    - Proximity radar
-    - Sheriff silent aim hook
-    - Custom hitbox expander with original-property restore
-    - Noclip
-    - WalkSpeed / JumpPower presets
-    - Coin farm tween
-    - Gun teleport / Sky safe spot
-    - FullBright + restore
-    - Animated modern UI, mobile drag, responsive scale
-    - Toast notifications and live status card
+    Fixes:
+    - Fixed UI drag lag & desync caused by dynamic UIScale on mobile
+    - Optimized Noclip (removed heavy GetDescendants scan in Stepped)
+    - Fixed Hitbox Expander (now targets HumanoidRootPart only to preserve player meshes)
+    - Enhanced cleanup & connection management
+
+    Added Features:
+    - Auto Grab Gun (Otomatis ambil gun drop saat sheriff mati)
+    - Knife Aura (Auto-slash pemain sekitar saat jadi Murderer)
+    - Sky Safe Platform (Platform kokoh di udara agar tidak jatuh bebas)
+    - Smart Coin Bag Limiter (Auto-stop farm & retreat ke safe spot saat koin penuh)
+    - Spectate Murderer & Sheriff
 ]]
 
 --==============================================================
@@ -87,14 +84,14 @@ local State = {
     TrapESP = true,
     Tracers = false,
     ProximityRadar = true,
-    AutoAim = true,
-    AutoAimSmooth = 0.28,
-    AimFOV = 260,
-    AimPrediction = 0.08,
+
+    SilentAim = true,
+    KnifeAura = false,
     HitboxExpander = false,
-    HitboxSize = 8,
+    HitboxSize = 14,
 
     AutoFarm = false,
+    AutoGrabGun = false,
     Noclip = false,
     WalkSpeed = 16,
     JumpPower = 50,
@@ -109,7 +106,7 @@ local Cache = {
     GunESP = nil,
     TrapESP = {},
     Tracers = {},
-    OriginalParts = setmetatable({}, { __mode = "k" }),
+    OriginalHRP = setmetatable({}, { __mode = "k" }),
     Role = {},
     RoleStamp = {},
 }
@@ -135,12 +132,14 @@ local RoleColors = {
 local UI = {}
 local currentFarmTween = nil
 local PlayerConnections = {}
-local OriginalCharacterCollision = setmetatable({}, { __mode = "k" })
+local SkyPlatformPart = nil
 local ProximityAlertFrame = nil
-local lastTrapScan = 0
 local ProximityAlertLabel = nil
 local StatusRoleLabel = nil
 local StatusInfoLabel = nil
+local lastTrapScan = 0
+local lastGrabAttempt = 0
+local lastKnifeAuraSlash = 0
 
 local HasDrawing = (typeof(Drawing) == "table" and typeof(Drawing.new) == "function")
 
@@ -165,22 +164,13 @@ local function disconnectAll()
 end
 
 local function tween(instance, info, props)
-    if not instance or not instance.Parent then
-        return
-    end
+    if not instance or not instance.Parent then return end
     local ok, tw = pcall(function()
         local obj = TweenService:Create(instance, info, props)
         obj:Play()
         return obj
     end)
     return ok and tw or nil
-end
-
-local function addConnection(key, connection)
-    if Connections[key] then
-        pcall(function() Connections[key]:Disconnect() end)
-    end
-    Connections[key] = connection
 end
 
 local function getCharacter(plr)
@@ -202,16 +192,14 @@ local function isAlive(plr)
 end
 
 local function notify(message, accent)
-    if not UI.ToastHolder or not UI.ToastHolder.Parent then
-        return
-    end
+    if not UI.ToastHolder or not UI.ToastHolder.Parent then return end
 
     accent = accent or Color3.fromRGB(95, 165, 255)
 
     local toast = Instance.new("Frame")
     toast.Size = UDim2.new(0, 250, 0, 42)
     toast.BackgroundColor3 = Color3.fromRGB(20, 22, 31)
-    toast.BackgroundTransparency = 0.02
+    toast.BackgroundTransparency = 0.05
     toast.BorderSizePixel = 0
     toast.LayoutOrder = -os.clock()
     toast.Parent = UI.ToastHolder
@@ -257,12 +245,8 @@ local function notify(message, accent)
             local out = tween(toast, TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
                 Position = UDim2.new(1, 16, 0, 0)
             })
-            if out then
-                out.Completed:Wait()
-            end
-            if toast and toast.Parent then
-                toast:Destroy()
-            end
+            if out then out.Completed:Wait() end
+            if toast and toast.Parent then toast:Destroy() end
         end
     end)
 end
@@ -271,10 +255,7 @@ end
 -- Role scanner
 --==============================================================
 local function classifyRoleString(value)
-    if typeof(value) ~= "string" then
-        return nil
-    end
-
+    if typeof(value) ~= "string" then return nil end
     local name = value:lower()
     if name:find("murder") or name:find("killer") then
         return "Murderer"
@@ -294,9 +275,7 @@ local function readRoleAttributes(plr)
         local ok, value = pcall(function() return plr:GetAttribute(attr) end)
         if ok then
             local role = classifyRoleString(value)
-            if role then
-                return role
-            end
+            if role then return role end
         end
     end
 
@@ -306,23 +285,18 @@ local function readRoleAttributes(plr)
             local ok, value = pcall(function() return char:GetAttribute(attr) end)
             if ok then
                 local role = classifyRoleString(value)
-                if role then
-                    return role
-                end
+                if role then return role end
             end
         end
     end
-
     return nil
 end
 
 local function getRole(plr, force)
-    if not plr then
-        return "Innocent"
-    end
+    if not plr then return "Innocent" end
 
     local stamp = os.clock()
-    if not force and Cache.Role[plr] and Cache.RoleStamp[plr] and stamp - Cache.RoleStamp[plr] < 0.35 then
+    if not force and Cache.Role[plr] and Cache.RoleStamp[plr] and (stamp - Cache.RoleStamp[plr] < 0.35) then
         return Cache.Role[plr]
     end
 
@@ -379,77 +353,59 @@ local function getMurdererPlayer()
     return nil
 end
 
---==============================================================
--- Sheriff auto-aim (camera based; mobile friendly)
---==============================================================
-local function getEquippedGun()
-    local char = LocalPlayer.Character
-    if not char then return nil end
-
-    for _, item in ipairs(char:GetChildren()) do
-        if item:IsA("Tool") then
-            local name = item.Name:lower()
-            if name:find("gun") or name:find("revolver") or name:find("pistol") or name:find("sheriff") then
-                return item
+local function getSheriffPlayer()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlive(plr) then
+            local r = getRole(plr)
+            if r == "Sheriff" or r == "Hero" then
+                return plr
             end
         end
     end
     return nil
 end
 
-local function getAimPart(plr)
-    local char = plr and plr.Character
-    if not char then return nil end
-    return char:FindFirstChild("Head")
-        or char:FindFirstChild("UpperTorso")
-        or char:FindFirstChild("Torso")
-        or char:FindFirstChild("HumanoidRootPart")
-end
+--==============================================================
+-- Silent aim hook
+--==============================================================
+safeCall(function()
+    if typeof(hookmetamethod) ~= "function" then return end
 
-local function getBestSheriffTarget()
-    if not Camera then return nil end
-    local murderer = getMurdererPlayer()
-    if not murderer then return nil end
+    local oldIndex
+    oldIndex = hookmetamethod(game, "__index", wrapCClosure(function(self, idx)
+        if not State.IsUnloaded and State.SilentAim and not isCaller() then
+            if typeof(self) == "Instance" and self:IsA("Mouse") then
+                if idx == "Hit" or idx == "Target" then
+                    local char = LocalPlayer.Character
+                    local tool = char and char:FindFirstChildWhichIsA("Tool")
+                    local toolName = tool and tool.Name:lower() or ""
 
-    local part = getAimPart(murderer)
-    if not part then return nil end
+                    if tool and (toolName:find("gun") or toolName:find("revolver") or toolName:find("pistol")) then
+                        local murderer = getMurdererPlayer()
+                        local mchar = murderer and murderer.Character
+                        if mchar then
+                            local targetPart = mchar:FindFirstChild("UpperTorso")
+                                or mchar:FindFirstChild("Torso")
+                                or mchar:FindFirstChild("HumanoidRootPart")
+                                or mchar:FindFirstChild("Head")
 
-    local targetPos = part.Position
-    local root = getRoot(murderer.Character)
-    if root then
-        local velocity = root.AssemblyLinearVelocity
-        targetPos = targetPos + velocity * State.AimPrediction
-    end
-
-    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
-    if not onScreen or screenPos.Z <= 0 then
-        return nil
-    end
-
-    local center = Vector2.new(Camera.ViewportSize.X * 0.5, Camera.ViewportSize.Y * 0.5)
-    local distanceFromCenter = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-    if distanceFromCenter > State.AimFOV then
-        return nil
-    end
-
-    return targetPos, murderer
-end
-
-local function updateAutoAim()
-    if State.IsUnloaded or not State.AutoAim then return end
-    if not getEquippedGun() then return end
-
-    local targetPos = getBestSheriffTarget()
-    if not targetPos then return end
-
-    local camPos = Camera.CFrame.Position
-    local desired = CFrame.lookAt(camPos, targetPos)
-    local alpha = math.clamp(State.AutoAimSmooth, 0.05, 1)
-    Camera.CFrame = Camera.CFrame:Lerp(desired, alpha)
-end
+                            if targetPart then
+                                if idx == "Hit" then
+                                    return targetPart.CFrame
+                                end
+                                return targetPart
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return oldIndex(self, idx)
+    end))
+end)
 
 --==============================================================
--- ESP
+-- ESP Features
 --==============================================================
 local function removePlayerESP(plr)
     local data = Cache.ESP[plr]
@@ -573,7 +529,6 @@ local function findGunDropPart()
             return obj
         end
     end
-
     return nil
 end
 
@@ -649,9 +604,7 @@ local function updateTrapESP(force)
         return
     end
 
-    if not force and os.clock() - lastTrapScan < 1.0 then
-        return
-    end
+    if not force and os.clock() - lastTrapScan < 1.0 then return end
     lastTrapScan = os.clock()
 
     local seen = {}
@@ -717,9 +670,7 @@ end
 
 local function renderTracers()
     if State.IsUnloaded or not State.Tracers or not HasDrawing then
-        if next(Cache.Tracers) then
-            clearTracers()
-        end
+        if next(Cache.Tracers) then clearTracers() end
         return
     end
 
@@ -740,9 +691,7 @@ local function renderTracers()
                     local line = Cache.Tracers[plr]
 
                     if not line then
-                        local ok, obj = pcall(function()
-                            return Drawing.new("Line")
-                        end)
+                        local ok, obj = pcall(function() return Drawing.new("Line") end)
                         if ok and obj then
                             obj.Thickness = 1.4
                             obj.Transparency = 0.9
@@ -774,97 +723,90 @@ local function renderTracers()
 end
 
 --==============================================================
--- Hitbox manager (stores original properties)
+-- Hitbox Expander (Optimized: Targets HRP only to avoid mesh distortion)
 --==============================================================
-local function cachePart(part)
-    if not part or Cache.OriginalParts[part] then
-        return
-    end
-
-    Cache.OriginalParts[part] = {
-        Size = part.Size,
-        Transparency = part.Transparency,
-        Color = part.Color,
-        Material = part.Material,
-        CanCollide = part.CanCollide,
-    }
-end
-
 local function applyHitbox(plr)
-    if State.IsUnloaded or not State.HitboxExpander or plr == LocalPlayer then
-        return
-    end
+    if State.IsUnloaded or not State.HitboxExpander or plr == LocalPlayer then return end
 
     local char = plr.Character
     if not char then return end
 
-    local role = getRole(plr)
-    local color = RoleColors[role] or RoleColors.Innocent
-    local parts = {
-        char:FindFirstChild("HumanoidRootPart"),
-        char:FindFirstChild("UpperTorso"),
-        char:FindFirstChild("Torso"),
-        char:FindFirstChild("Head"),
-    }
-
-    for _, part in ipairs(parts) do
-        if part and part:IsA("BasePart") then
-            cachePart(part)
-            part.Size = Vector3.new(State.HitboxSize, State.HitboxSize, State.HitboxSize)
-            part.Transparency = (part.Name == "HumanoidRootPart") and 0.68 or 0.78
-            part.Color = color
-            part.Material = Enum.Material.ForceField
-            part.CanCollide = false
-            pcall(function() part.CanQuery = true end)
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and hrp:IsA("BasePart") then
+        if not Cache.OriginalHRP[hrp] then
+            Cache.OriginalHRP[hrp] = {
+                Size = hrp.Size,
+                Transparency = hrp.Transparency,
+                CanCollide = hrp.CanCollide,
+            }
         end
+
+        local role = getRole(plr)
+        local color = RoleColors[role] or RoleColors.Innocent
+
+        hrp.Size = Vector3.new(State.HitboxSize, State.HitboxSize, State.HitboxSize)
+        hrp.Transparency = 0.72
+        hrp.Color = color
+        hrp.Material = Enum.Material.ForceField
+        hrp.CanCollide = false
+        pcall(function() hrp.CanQuery = true end)
     end
 end
 
-local function restorePart(part)
-    local original = Cache.OriginalParts[part]
-    if not original then return end
-    if not part or not part.Parent then return end
+local function restoreHitbox(part)
+    local original = Cache.OriginalHRP[part]
+    if not original or not part or not part.Parent then return end
 
     pcall(function()
         part.Size = original.Size
         part.Transparency = original.Transparency
-        part.Color = original.Color
-        part.Material = original.Material
         part.CanCollide = original.CanCollide
     end)
-
-    Cache.OriginalParts[part] = nil
+    Cache.OriginalHRP[part] = nil
 end
 
 local function resetAllHitboxes()
-    for part in pairs(Cache.OriginalParts) do
-        restorePart(part)
+    for part in pairs(Cache.OriginalHRP) do
+        restoreHitbox(part)
     end
 end
 
 --==============================================================
--- Local collision manager
+-- Combat Features: Knife Aura
 --==============================================================
-local function setLocalCollision(enabled)
+local function runKnifeAura()
+    if not State.KnifeAura or State.IsUnloaded then return end
+    if os.clock() - lastKnifeAuraSlash < 0.25 then return end
+
     local char = LocalPlayer.Character
     if not char then return end
 
-    if enabled then
-        for part, original in pairs(OriginalCharacterCollision) do
-            if part and part.Parent == char then
-                pcall(function() part.CanCollide = original end)
-            end
-            OriginalCharacterCollision[part] = nil
-        end
+    local role = getRole(LocalPlayer)
+    if role ~= "Murderer" then return end
+
+    local knife = char:FindFirstChildOfClass("Tool")
+    if not knife then return end
+    local kName = knife.Name:lower()
+    if not (kName:find("knife") or kName:find("blade") or kName:find("slash") or kName:find("dagger")) then
         return
     end
 
-    for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") then
-            if OriginalCharacterCollision[part] == nil then
-                OriginalCharacterCollision[part] = part.CanCollide
+    local myRoot = getRoot(char)
+    if not myRoot then return end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and isAlive(plr) and getRole(plr) ~= "Murderer" then
+            local enemyRoot = getRoot(plr.Character)
+            if enemyRoot then
+                local dist = (enemyRoot.Position - myRoot.Position).Magnitude
+                if dist <= 14 then
+                    lastKnifeAuraSlash = os.clock()
+                    pcall(function()
+                        knife:Activate()
+                    end)
+                    break
+                end
             end
-            part.CanCollide = false
         end
     end
 end
@@ -895,13 +837,57 @@ local function restoreMovement()
 end
 
 --==============================================================
--- Farming
+-- Farming & World (Safe Platform & Auto Grab Gun)
 --==============================================================
 local function stopFarmTween()
     if currentFarmTween then
         pcall(function() currentFarmTween:Cancel() end)
         currentFarmTween = nil
     end
+end
+
+local function ensureSkyPlatform(pos)
+    if not SkyPlatformPart or not SkyPlatformPart.Parent then
+        SkyPlatformPart = Instance.new("Part")
+        SkyPlatformPart.Name = "LRN3_SkyPlatform"
+        SkyPlatformPart.Size = Vector3.new(24, 1.5, 24)
+        SkyPlatformPart.Anchored = true
+        SkyPlatformPart.CanCollide = true
+        SkyPlatformPart.Transparency = 0.5
+        SkyPlatformPart.Color = Color3.fromRGB(30, 35, 50)
+        SkyPlatformPart.Material = Enum.Material.SmoothPlastic
+        SkyPlatformPart.Parent = Workspace
+    end
+    SkyPlatformPart.CFrame = CFrame.new(pos - Vector3.new(0, 3, 0))
+end
+
+local function removeSkyPlatform()
+    if SkyPlatformPart and SkyPlatformPart.Parent then
+        pcall(function() SkyPlatformPart:Destroy() end)
+    end
+    SkyPlatformPart = nil
+end
+
+local function goToSky()
+    local root = getRoot(LocalPlayer.Character)
+    if not root then return end
+
+    local targetPos = root.Position + Vector3.new(0, 110, 0)
+    ensureSkyPlatform(targetPos)
+    root.CFrame = CFrame.new(targetPos)
+    notify("Safe platform aktif di langit.", Color3.fromRGB(130, 175, 255))
+end
+
+local function teleportToGun()
+    local gun = findGunDropPart()
+    local root = getRoot(LocalPlayer.Character)
+    if not gun or not root then
+        notify("Gun drop belum ketemu.", RoleColors.GunDrop)
+        return
+    end
+
+    root.CFrame = gun.CFrame + Vector3.new(0, 2.5, 0)
+    notify("Teleported ke gun drop.", RoleColors.GunDrop)
 end
 
 local function getTargetCoins()
@@ -928,28 +914,40 @@ local function getTargetCoins()
     return coins
 end
 
-local function teleportToGun()
-    local gun = findGunDropPart()
-    local root = getRoot(LocalPlayer.Character)
-    if not gun or not root then
-        notify("Gun drop belum ketemu.", RoleColors.GunDrop)
-        return
-    end
+-- Smart Coin Bag Reader to prevent unnecessary farming when full
+local function isCoinBagFull()
+    local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pgui then return false end
 
-    root.CFrame = gun.CFrame + Vector3.new(0, 3, 0)
-    notify("Teleported ke gun drop.", RoleColors.GunDrop)
-end
+    local mainGui = pgui:FindFirstChild("MainGUI")
+    if not mainGui then return false end
 
-local function goToSky()
-    local root = getRoot(LocalPlayer.Character)
-    if root then
-        root.CFrame = root.CFrame + Vector3.new(0, 100, 0)
-        notify("Dipindahkan ke safe spot udara.", Color3.fromRGB(130, 175, 255))
+    local gameFrame = mainGui:FindFirstChild("Game")
+    if not gameFrame then return false end
+
+    local coinBag = gameFrame:FindFirstChild("CoinBags", true) or gameFrame:FindFirstChild("CoinBag", true)
+    if coinBag then
+        local amount = coinBag:FindFirstChild("Amount", true)
+        if amount and amount:IsA("TextLabel") then
+            local cur, max = amount.Text:match("(%d+)%s*/%s*(%d+)")
+            if cur and max and tonumber(cur) and tonumber(max) then
+                if tonumber(cur) >= tonumber(max) then
+                    return true
+                end
+            end
+        end
     end
+    return false
 end
 
 local function runFarmStep()
-    if not State.AutoFarm or State.IsUnloaded then
+    if not State.AutoFarm or State.IsUnloaded then return end
+
+    if isCoinBagFull() then
+        State.AutoFarm = false
+        stopFarmTween()
+        notify("Tas koin penuh! Mundur ke safe platform.", Color3.fromRGB(78, 230, 150))
+        goToSky()
         return
     end
 
@@ -958,29 +956,65 @@ local function runFarmStep()
 
     local coins = getTargetCoins()
     for _, coin in ipairs(coins) do
-        if not State.AutoFarm or State.IsUnloaded then
-            break
-        end
+        if not State.AutoFarm or State.IsUnloaded then break end
         if coin and coin.Parent and coin:IsDescendantOf(Workspace) then
             root = getRoot(LocalPlayer.Character)
             if not root then break end
 
             local distance = (root.Position - coin.Position).Magnitude
-            local speed = 24
-            local duration = math.clamp(distance / speed, 0.10, 3.25)
+            local speed = 26
+            local duration = math.clamp(distance / speed, 0.08, 3.0)
 
             root.AssemblyLinearVelocity = Vector3.zero
             currentFarmTween = TweenService:Create(root, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
-                CFrame = coin.CFrame + Vector3.new(0, 1.25, 0)
+                CFrame = coin.CFrame + Vector3.new(0, 1.2, 0)
             })
             currentFarmTween:Play()
 
-            local ok = pcall(function()
-                currentFarmTween.Completed:Wait()
-            end)
+            local ok = pcall(function() currentFarmTween.Completed:Wait() end)
             if not ok then break end
-            task.wait(0.08)
+            task.wait(0.06)
         end
+    end
+end
+
+local function runAutoGrabGun()
+    if not State.AutoGrabGun or State.IsUnloaded then return end
+    if os.clock() - lastGrabAttempt < 1.5 then return end
+
+    local myRole = getRole(LocalPlayer)
+    if myRole == "Murderer" or myRole == "Sheriff" or myRole == "Hero" then
+        return
+    end
+
+    local gun = findGunDropPart()
+    local root = getRoot(LocalPlayer.Character)
+    if gun and root then
+        lastGrabAttempt = os.clock()
+        local originalCF = root.CFrame
+        root.CFrame = gun.CFrame + Vector3.new(0, 1.5, 0)
+        notify("Mengambil gun drop otomatis!", RoleColors.GunDrop)
+        task.wait(0.35)
+    end
+end
+
+--==============================================================
+-- Spectate Functions
+--==============================================================
+local function spectatePlayer(plr)
+    if not plr or not plr.Character then return end
+    local hum = getHumanoid(plr.Character)
+    if hum then
+        Camera.CameraSubject = hum
+        notify("Spectating: " .. (plr.DisplayName or plr.Name), RoleColors.Sheriff)
+    end
+end
+
+local function resetSpectate()
+    local hum = getHumanoid(LocalPlayer.Character)
+    if hum then
+        Camera.CameraSubject = hum
+        notify("Spectate di-reset ke diri sendiri.", Color3.fromRGB(150, 160, 180))
     end
 end
 
@@ -1007,7 +1041,7 @@ local function setFullBright(enabled)
 end
 
 --==============================================================
--- UI creation helpers
+-- UI Construction
 --==============================================================
 local uiHost = nil
 if typeof(gethui) == "function" then
@@ -1019,13 +1053,13 @@ if not uiHost then
     uiHost = LocalPlayer:WaitForChild("PlayerGui")
 end
 
-local oldGui = uiHost:FindFirstChild("LRN_MM2_ULTIMATE_V4")
+local oldGui = uiHost:FindFirstChild("LRN_MM2_ULTIMATE_V3")
 if oldGui then
     pcall(function() oldGui:Destroy() end)
 end
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "LRN_MM2_ULTIMATE_V4"
+ScreenGui.Name = "LRN_MM2_ULTIMATE_V3"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.IgnoreGuiInset = true
@@ -1054,8 +1088,8 @@ toastLayout.Parent = ToastHolder
 -- Proximity alert
 local alert = Instance.new("Frame")
 alert.Name = "LRN3_ProximityAlert"
-alert.Size = UDim2.new(0, 270, 0, 38)
-alert.Position = UDim2.new(0.5, -135, 0, 12)
+alert.Size = UDim2.new(0, 310, 0, 42)
+alert.Position = UDim2.new(0.5, -155, 0, 18)
 alert.BackgroundColor3 = Color3.fromRGB(36, 20, 26)
 alert.BackgroundTransparency = 0.05
 alert.BorderSizePixel = 0
@@ -1086,10 +1120,10 @@ alertLabel.Parent = alert
 ProximityAlertFrame = alert
 ProximityAlertLabel = alertLabel
 
--- Floating pill
+-- Floating Pill button
 local Pill = Instance.new("TextButton")
 Pill.Name = "MenuPill"
-Pill.Size = UDim2.new(0, 52, 0, 52)
+Pill.Size = UDim2.new(0, 58, 0, 58)
 Pill.Position = UDim2.new(0, 16, 0.42, 0)
 Pill.BackgroundColor3 = Color3.fromRGB(17, 19, 28)
 Pill.BorderSizePixel = 0
@@ -1124,11 +1158,11 @@ local pillDotCorner = Instance.new("UICorner")
 pillDotCorner.CornerRadius = UDim.new(1, 0)
 pillDotCorner.Parent = pillDot
 
--- Main window
+-- Main Window
 local Main = Instance.new("Frame")
 Main.Name = "Main"
-Main.Size = UDim2.new(0, 320, 0, 365)
-Main.Position = UDim2.new(0.5, -160, 0.5, -182)
+Main.Size = UDim2.new(0, 370, 0, 435)
+Main.Position = UDim2.new(0.5, -185, 0.5, -217)
 Main.BackgroundColor3 = Color3.fromRGB(13, 15, 22)
 Main.BorderSizePixel = 0
 Main.Active = true
@@ -1147,21 +1181,8 @@ mainStroke.Thickness = 1.2
 mainStroke.Transparency = 0.1
 mainStroke.Parent = Main
 
-local shadow = Instance.new("ImageLabel")
-shadow.Name = "Shadow"
-shadow.AnchorPoint = Vector2.new(0.5, 0.5)
-shadow.Position = UDim2.new(0.5, 0, 0.5, 8)
-shadow.Size = UDim2.new(1, 30, 1, 30)
-shadow.BackgroundTransparency = 1
-shadow.Image = "rbxassetid://6014261993"
-shadow.ImageTransparency = 0.7
-shadow.ScaleType = Enum.ScaleType.Slice
-shadow.SliceCenter = Rect.new(49, 49, 450, 450)
-shadow.ZIndex = 69
-shadow.Parent = Main
-
 local Header = Instance.new("Frame")
-Header.Size = UDim2.new(1, 0, 0, 64)
+Header.Size = UDim2.new(1, 0, 0, 72)
 Header.BackgroundColor3 = Color3.fromRGB(19, 22, 32)
 Header.BorderSizePixel = 0
 Header.ZIndex = 71
@@ -1199,7 +1220,7 @@ local Subtitle = Instance.new("TextLabel")
 Subtitle.Size = UDim2.new(1, -112, 0, 18)
 Subtitle.Position = UDim2.new(0, 26, 0, 38)
 Subtitle.BackgroundTransparency = 1
-Subtitle.Text = "clean • responsive • executor friendly"
+Subtitle.Text = "v3.2 • responsive & optimized"
 Subtitle.TextColor3 = Color3.fromRGB(125, 134, 154)
 Subtitle.TextSize = 9
 Subtitle.Font = Enum.Font.GothamMedium
@@ -1207,34 +1228,9 @@ Subtitle.TextXAlignment = Enum.TextXAlignment.Left
 Subtitle.ZIndex = 72
 Subtitle.Parent = Header
 
-local HeaderDot = Instance.new("Frame")
-HeaderDot.Size = UDim2.new(0, 7, 0, 7)
-HeaderDot.Position = UDim2.new(1, -82, 0, 18)
-HeaderDot.BackgroundColor3 = Color3.fromRGB(80, 228, 150)
-HeaderDot.BorderSizePixel = 0
-HeaderDot.ZIndex = 72
-HeaderDot.Parent = Header
-
-local headerDotCorner = Instance.new("UICorner")
-headerDotCorner.CornerRadius = UDim.new(1, 0)
-headerDotCorner.Parent = HeaderDot
-
-local HeaderState = Instance.new("TextLabel")
-HeaderState.Size = UDim2.new(0, 58, 0, 16)
-HeaderState.Position = UDim2.new(1, -69, 0, 13)
-HeaderState.BackgroundTransparency = 1
-HeaderState.Text = "READY"
-HeaderState.TextColor3 = Color3.fromRGB(150, 230, 185)
-HeaderState.TextSize = 8
-HeaderState.Font = Enum.Font.GothamBold
-HeaderState.TextXAlignment = Enum.TextXAlignment.Right
-HeaderState.ZIndex = 72
-HeaderState.Parent = Header
-
 local Close = Instance.new("TextButton")
 Close.Size = UDim2.new(0, 28, 0, 28)
-Close.Position = UDim2.new(1, -40, 1, -39)
-Close.AnchorPoint = Vector2.new(0, 0)
+Close.Position = UDim2.new(1, -38, 0, 14)
 Close.BackgroundColor3 = Color3.fromRGB(31, 34, 47)
 Close.BorderSizePixel = 0
 Close.Text = "×"
@@ -1242,17 +1238,17 @@ Close.TextColor3 = Color3.fromRGB(190, 198, 214)
 Close.TextSize = 16
 Close.Font = Enum.Font.GothamMedium
 Close.AutoButtonColor = false
-Close.ZIndex = 72
-Close.Parent = Main
+Close.ZIndex = 73
+Close.Parent = Header
 
 local closeCorner = Instance.new("UICorner")
 closeCorner.CornerRadius = UDim.new(0, 8)
 closeCorner.Parent = Close
 
--- Status card
+-- Status Card
 local StatusCard = Instance.new("Frame")
-StatusCard.Size = UDim2.new(1, -24, 0, 54)
-StatusCard.Position = UDim2.new(0, 12, 0, 74)
+StatusCard.Size = UDim2.new(1, -28, 0, 54)
+StatusCard.Position = UDim2.new(0, 14, 0, 82)
 StatusCard.BackgroundColor3 = Color3.fromRGB(18, 21, 31)
 StatusCard.BorderSizePixel = 0
 StatusCard.ZIndex = 71
@@ -1267,20 +1263,9 @@ statusStroke.Color = Color3.fromRGB(38, 43, 60)
 statusStroke.Thickness = 1
 statusStroke.Parent = StatusCard
 
-local statusTitle = Instance.new("TextLabel")
-statusTitle.Size = UDim2.new(0, 140, 0, 16)
-statusTitle.Position = UDim2.new(0, 12, 0, 10)
-statusTitle.BackgroundTransparency = 1
-statusTitle.Text = "LIVE STATUS"
-statusTitle.TextColor3 = Color3.fromRGB(102, 117, 145)
-statusTitle.TextSize = 8
-statusTitle.Font = Enum.Font.GothamBold
-statusTitle.TextXAlignment = Enum.TextXAlignment.Left
-statusTitle.Parent = StatusCard
-
 StatusRoleLabel = Instance.new("TextLabel")
 StatusRoleLabel.Size = UDim2.new(0, 155, 0, 20)
-StatusRoleLabel.Position = UDim2.new(0, 12, 0, 25)
+StatusRoleLabel.Position = UDim2.new(0, 12, 0, 17)
 StatusRoleLabel.BackgroundTransparency = 1
 StatusRoleLabel.Text = "ROLE  •  UNKNOWN"
 StatusRoleLabel.TextColor3 = Color3.fromRGB(236, 240, 248)
@@ -1291,32 +1276,31 @@ StatusRoleLabel.Parent = StatusCard
 
 StatusInfoLabel = Instance.new("TextLabel")
 StatusInfoLabel.Size = UDim2.new(0, 170, 0, 16)
-StatusInfoLabel.Position = UDim2.new(1, -182, 0, 29)
+StatusInfoLabel.Position = UDim2.new(1, -182, 0, 19)
 StatusInfoLabel.BackgroundTransparency = 1
-StatusInfoLabel.Text = "ESP ON  •  AUTO AIM ON"
+StatusInfoLabel.Text = "ESP ON  •  AIM ON"
 StatusInfoLabel.TextColor3 = Color3.fromRGB(132, 143, 166)
 StatusInfoLabel.TextSize = 8
 StatusInfoLabel.Font = Enum.Font.GothamMedium
 StatusInfoLabel.TextXAlignment = Enum.TextXAlignment.Right
 StatusInfoLabel.Parent = StatusCard
 
--- Tabs
+-- Tabs Navigation
 local TabBar = Instance.new("Frame")
-TabBar.Size = UDim2.new(1, -24, 0, 30)
-TabBar.Position = UDim2.new(0, 12, 0, 142)
+TabBar.Size = UDim2.new(1, -28, 0, 32)
+TabBar.Position = UDim2.new(0, 14, 0, 144)
 TabBar.BackgroundTransparency = 1
 TabBar.ZIndex = 72
 TabBar.Parent = Main
 
 local tabLayout = Instance.new("UIListLayout")
 tabLayout.FillDirection = Enum.FillDirection.Horizontal
-tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
 tabLayout.Padding = UDim.new(0, 5)
 tabLayout.Parent = TabBar
 
 local ContentArea = Instance.new("Frame")
-ContentArea.Size = UDim2.new(1, -24, 1, -182)
-ContentArea.Position = UDim2.new(0, 12, 0, 176)
+ContentArea.Size = UDim2.new(1, -28, 1, -188)
+ContentArea.Position = UDim2.new(0, 14, 0, 182)
 ContentArea.BackgroundTransparency = 1
 ContentArea.ZIndex = 71
 ContentArea.Parent = Main
@@ -1326,7 +1310,7 @@ local TabButtons = {}
 
 local function createTab(name)
     local button = Instance.new("TextButton")
-    button.Size = UDim2.new(0, 69, 0, 29)
+    button.Size = UDim2.new(0, 79, 0, 30)
     button.BackgroundColor3 = Color3.fromRGB(21, 24, 34)
     button.BorderSizePixel = 0
     button.Text = name
@@ -1360,7 +1344,7 @@ local function createTab(name)
     padding.Parent = scroll
 
     local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 7)
+    layout.Padding = UDim.new(0, 6)
     layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Parent = scroll
 
@@ -1381,7 +1365,6 @@ local function createTab(name)
             })
         end
     end)
-
     return scroll
 end
 
@@ -1392,7 +1375,7 @@ local utilityTab = createTab("Utility")
 
 local function sectionLabel(parent, text)
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, 0, 0, 18)
+    label.Size = UDim2.new(1, 0, 0, 16)
     label.BackgroundTransparency = 1
     label.Text = text
     label.TextColor3 = Color3.fromRGB(92, 106, 132)
@@ -1406,7 +1389,7 @@ end
 
 local function createToggle(parent, title, subtitle, initial, callback)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, 0, 0, 46)
+    row.Size = UDim2.new(1, 0, 0, 48)
     row.BackgroundColor3 = Color3.fromRGB(18, 21, 31)
     row.BorderSizePixel = 0
     row.ZIndex = 73
@@ -1422,7 +1405,7 @@ local function createToggle(parent, title, subtitle, initial, callback)
     stroke.Parent = row
 
     local titleLabel = Instance.new("TextLabel")
-    titleLabel.Size = UDim2.new(1, -82, 0, 20)
+    titleLabel.Size = UDim2.new(1, -82, 0, 18)
     titleLabel.Position = UDim2.new(0, 12, 0, 7)
     titleLabel.BackgroundTransparency = 1
     titleLabel.Text = title
@@ -1435,7 +1418,7 @@ local function createToggle(parent, title, subtitle, initial, callback)
 
     local subLabel = Instance.new("TextLabel")
     subLabel.Size = UDim2.new(1, -82, 0, 13)
-    subLabel.Position = UDim2.new(0, 12, 0, 27)
+    subLabel.Position = UDim2.new(0, 12, 0, 25)
     subLabel.BackgroundTransparency = 1
     subLabel.Text = subtitle or ""
     subLabel.TextColor3 = Color3.fromRGB(104, 115, 137)
@@ -1487,15 +1470,12 @@ local function createToggle(parent, title, subtitle, initial, callback)
     end)
 
     render(false)
-    return row, function(newValue)
-        value = newValue == true
-        render(true)
-    end
+    return row
 end
 
 local function createAction(parent, title, subtitle, callback, accent)
     local button = Instance.new("TextButton")
-    button.Size = UDim2.new(1, 0, 0, 42)
+    button.Size = UDim2.new(1, 0, 0, 44)
     button.BackgroundColor3 = Color3.fromRGB(18, 21, 31)
     button.BorderSizePixel = 0
     button.Text = ""
@@ -1513,8 +1493,8 @@ local function createAction(parent, title, subtitle, callback, accent)
     stroke.Parent = button
 
     local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(0, 3, 0, 25)
-    bar.Position = UDim2.new(0, 10, 0.5, -12.5)
+    bar.Size = UDim2.new(0, 3, 0, 24)
+    bar.Position = UDim2.new(0, 10, 0.5, -12)
     bar.BackgroundColor3 = accent or Color3.fromRGB(84, 145, 230)
     bar.BorderSizePixel = 0
     bar.ZIndex = 74
@@ -1525,7 +1505,7 @@ local function createAction(parent, title, subtitle, callback, accent)
     barCorner.Parent = bar
 
     local titleLabel = Instance.new("TextLabel")
-    titleLabel.Size = UDim2.new(1, -42, 0, 18)
+    titleLabel.Size = UDim2.new(1, -42, 0, 17)
     titleLabel.Position = UDim2.new(0, 20, 0, 6)
     titleLabel.BackgroundTransparency = 1
     titleLabel.Text = title
@@ -1538,7 +1518,7 @@ local function createAction(parent, title, subtitle, callback, accent)
 
     local subLabel = Instance.new("TextLabel")
     subLabel.Size = UDim2.new(1, -42, 0, 12)
-    subLabel.Position = UDim2.new(0, 20, 0, 25)
+    subLabel.Position = UDim2.new(0, 20, 0, 24)
     subLabel.BackgroundTransparency = 1
     subLabel.Text = subtitle or ""
     subLabel.TextColor3 = Color3.fromRGB(100, 112, 135)
@@ -1547,17 +1527,6 @@ local function createAction(parent, title, subtitle, callback, accent)
     subLabel.TextXAlignment = Enum.TextXAlignment.Left
     subLabel.ZIndex = 74
     subLabel.Parent = button
-
-    local arrow = Instance.new("TextLabel")
-    arrow.Size = UDim2.new(0, 18, 0, 18)
-    arrow.Position = UDim2.new(1, -25, 0.5, -9)
-    arrow.BackgroundTransparency = 1
-    arrow.Text = ">"
-    arrow.TextColor3 = Color3.fromRGB(100, 113, 136)
-    arrow.TextSize = 11
-    arrow.Font = Enum.Font.GothamBold
-    arrow.ZIndex = 74
-    arrow.Parent = button
 
     button.MouseButton1Click:Connect(function()
         tween(button, TweenInfo.new(0.08), { BackgroundColor3 = Color3.fromRGB(26, 31, 45) })
@@ -1568,27 +1537,13 @@ local function createAction(parent, title, subtitle, callback, accent)
         end)
         pcall(callback)
     end)
-
     return button
 end
 
-local function switchTab(tabName)
-    local btn = TabButtons[tabName]
-    if not btn then return end
-    State.CurrentTab = tabName
-    for name, frame in pairs(TabFrames) do
-        frame.Visible = (name == tabName)
-    end
-    for name, tabButton in pairs(TabButtons) do
-        local selected = name == tabName
-        tabButton.BackgroundColor3 = selected and Color3.fromRGB(42, 72, 132) or Color3.fromRGB(21, 24, 34)
-        tabButton.TextColor3 = selected and Color3.fromRGB(245, 248, 255) or Color3.fromRGB(135, 145, 164)
-    end
-end
-
 --==============================================================
--- Build tabs
+-- Build Tabs Content
 --==============================================================
+-- Visuals
 sectionLabel(visualsTab, "PLAYER VISIBILITY")
 createToggle(visualsTab, "Role ESP", "Highlight + live role tag", State.RoleESP, function(on)
     State.RoleESP = on
@@ -1596,17 +1551,14 @@ createToggle(visualsTab, "Role ESP", "Highlight + live role tag", State.RoleESP,
         for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= LocalPlayer then createPlayerESP(plr) end
         end
-        notify("Role ESP enabled.", RoleColors.Innocent)
     else
         clearAllESP()
-        notify("Role ESP disabled.", Color3.fromRGB(130, 140, 160))
     end
 end)
 
 createToggle(visualsTab, "Gun Drop ESP", "Track dropped sheriff gun", State.GunESP, function(on)
     State.GunESP = on
     updateGunDropESP()
-    notify(on and "Gun ESP enabled." or "Gun ESP disabled.", RoleColors.GunDrop)
 end)
 
 createToggle(visualsTab, "Trap ESP", "Detect trap / mine objects", State.TrapESP, function(on)
@@ -1621,110 +1573,111 @@ end)
 
 createToggle(visualsTab, "Murderer Radar", "Alert when danger is nearby", State.ProximityRadar, function(on)
     State.ProximityRadar = on
-    if not on and ProximityAlertFrame then
-        ProximityAlertFrame.Visible = false
-    end
+    if not on and ProximityAlertFrame then ProximityAlertFrame.Visible = false end
 end)
 
-sectionLabel(combatTab, "TARGETING")
-createToggle(combatTab, "Sheriff Auto Aim", "Camera lock to murderer while holding gun", State.AutoAim, function(on)
-    State.AutoAim = on
-    notify(on and "Sheriff auto aim ON." or "Sheriff auto aim OFF.", RoleColors.Sheriff)
+sectionLabel(visualsTab, "SPECTATE")
+createAction(visualsTab, "Spectate Murderer", "Kamera fokus ke murderer", function()
+    local m = getMurdererPlayer()
+    if m then spectatePlayer(m) else notify("Murderer tidak ditemukan.", RoleColors.Murderer) end
+end, RoleColors.Murderer)
+
+createAction(visualsTab, "Spectate Sheriff", "Kamera fokus ke sheriff", function()
+    local s = getSheriffPlayer()
+    if s then spectatePlayer(s) else notify("Sheriff tidak ditemukan.", RoleColors.Sheriff) end
+end, RoleColors.Sheriff)
+
+createAction(visualsTab, "Reset Camera", "Kembalikan kamera ke dirimu", function()
+    resetSpectate()
+end, Color3.fromRGB(140, 150, 170))
+
+-- Combat
+sectionLabel(combatTab, "TARGETING & ATTACK")
+createToggle(combatTab, "Sheriff Silent Aim", "Auto target murderer saat pegang gun", State.SilentAim, function(on)
+    State.SilentAim = on
+    notify(on and "Silent aim ON." or "Silent aim OFF.", RoleColors.Sheriff)
 end)
 
-createAction(combatTab, "Aim FOV 260", "Target window around screen center", function()
-    State.AimFOV = 260
-    notify("Aim FOV set to 260.", RoleColors.Sheriff)
-end, RoleColors.Sheriff)
+createToggle(combatTab, "Knife Aura", "Auto-slash pemain saat dekat (Murderer)", State.KnifeAura, function(on)
+    State.KnifeAura = on
+    notify(on and "Knife Aura ON." or "Knife Aura OFF.", RoleColors.Murderer)
+end)
 
-createAction(combatTab, "Aim FOV 420", "Wider target window", function()
-    State.AimFOV = 420
-    notify("Aim FOV set to 420.", RoleColors.Sheriff)
-end, RoleColors.Sheriff)
-
-createToggle(combatTab, "Custom Hitbox", "Expand target parts for easier hits", State.HitboxExpander, function(on)
+createToggle(combatTab, "Custom Hitbox (HRP)", "Expand RootPart lawan tanpa bug visual", State.HitboxExpander, function(on)
     State.HitboxExpander = on
     if on then
         for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= LocalPlayer then applyHitbox(plr) end
         end
-        notify(string.format("Hitbox: %d studs.", State.HitboxSize), RoleColors.Murderer)
     else
         resetAllHitboxes()
-        notify("Original hitboxes restored.", Color3.fromRGB(130, 140, 160))
+        notify("Hitbox asli dikembalikan.", Color3.fromRGB(130, 140, 160))
     end
 end)
 
-createAction(combatTab, "Hitbox 8", "Balanced client-side preset", function()
-    State.HitboxSize = 8
-    if State.HitboxExpander then
-        for _, plr in ipairs(Players:GetPlayers()) do applyHitbox(plr) end
-    end
-    notify("Hitbox preset set to 8.", RoleColors.Murderer)
-end, Color3.fromRGB(95, 165, 255))
-
-createAction(combatTab, "Hitbox 14", "Large client-side preset", function()
+createAction(combatTab, "Hitbox Size 14", "Balanced size preset", function()
     State.HitboxSize = 14
     if State.HitboxExpander then
         for _, plr in ipairs(Players:GetPlayers()) do applyHitbox(plr) end
     end
-    notify("Hitbox preset set to 14.", RoleColors.Murderer)
-end, Color3.fromRGB(255, 90, 105))
+    notify("Hitbox set to 14.", RoleColors.Murderer)
+end, Color3.fromRGB(95, 165, 255))
 
-createAction(combatTab, "Restore Hitboxes", "Return parts to saved originals", function()
-    resetAllHitboxes()
-end, Color3.fromRGB(150, 160, 180))
+createAction(combatTab, "Hitbox Size 25", "Large size preset", function()
+    State.HitboxSize = 25
+    if State.HitboxExpander then
+        for _, plr in ipairs(Players:GetPlayers()) do applyHitbox(plr) end
+    end
+    notify("Hitbox set to 25.", RoleColors.Murderer)
+end, RoleColors.Murderer)
 
+-- Movement
 sectionLabel(movementTab, "MOVEMENT")
-createToggle(movementTab, "Noclip", "Disable local character collisions", State.Noclip, function(on)
+createToggle(movementTab, "Noclip", "Disable collisions (Optimized)", State.Noclip, function(on)
     State.Noclip = on
 end)
 
-createAction(movementTab, "WalkSpeed 16", "Normal", function()
-    State.WalkSpeed = 16
-    updateWalkSpeed()
-end, Color3.fromRGB(130, 145, 165))
-
-createAction(movementTab, "WalkSpeed 35", "Fast", function()
-    State.WalkSpeed = 35
+createAction(movementTab, "WalkSpeed 32", "Speed boost", function()
+    State.WalkSpeed = 32
     updateWalkSpeed()
 end, Color3.fromRGB(90, 170, 255))
 
-createAction(movementTab, "WalkSpeed 55", "Ultra", function()
-    State.WalkSpeed = 55
-    updateWalkSpeed()
-end, Color3.fromRGB(255, 190, 75))
-
-createAction(movementTab, "JumpPower 90", "High jump", function()
-    State.JumpPower = 90
+createAction(movementTab, "JumpPower 85", "High jump", function()
+    State.JumpPower = 85
     updateJumpPower()
 end, Color3.fromRGB(130, 220, 160))
 
-createAction(movementTab, "Reset Movement", "WalkSpeed 16 + JumpPower 50", function()
+createAction(movementTab, "Reset Movement", "Kembalikan ke standar (16/50)", function()
     restoreMovement()
 end, Color3.fromRGB(145, 155, 175))
 
-sectionLabel(utilityTab, "FARM / WORLD")
-createToggle(utilityTab, "Auto Farm Coin", "Nearest coin → smooth tween", State.AutoFarm, function(on)
-    State.AutoFarm = on
-    if not on then stopFarmTween() end
-    notify(on and "Coin farm started." or "Coin farm stopped.", Color3.fromRGB(255, 213, 80))
+-- Utility
+sectionLabel(utilityTab, "AUTOMATION & SAFE ZONE")
+createToggle(utilityTab, "Auto Grab Gun", "Otomatis ambil gun saat sheriff gugur", State.AutoGrabGun, function(on)
+    State.AutoGrabGun = on
+    notify(on and "Auto Grab Gun ON." or "Auto Grab Gun OFF.", RoleColors.GunDrop)
 end)
 
-createAction(utilityTab, "Teleport to Gun", "Jump directly to dropped gun", function()
-    teleportToGun()
-end, RoleColors.GunDrop)
+createToggle(utilityTab, "Auto Farm Coin", "Smart farming + auto retreat saat full", State.AutoFarm, function(on)
+    State.AutoFarm = on
+    if not on then stopFarmTween() end
+    notify(on and "Coin farm aktif." or "Coin farm berhenti.", Color3.fromRGB(255, 213, 80))
+end)
 
-createAction(utilityTab, "Sky Safe Spot", "Move 100 studs upward", function()
+createAction(utilityTab, "Sky Safe Platform", "Pindah ke langit + buat pijakan aman", function()
     goToSky()
 end, Color3.fromRGB(120, 180, 255))
 
-createToggle(utilityTab, "FullBright", "Remove fog and boost visibility", State.FullBright, function(on)
+createAction(utilityTab, "Teleport to Gun", "Lompat langsung ke pistol jatuh", function()
+    teleportToGun()
+end, RoleColors.GunDrop)
+
+createToggle(utilityTab, "FullBright", "Hapus fog dan maksimalkan cahaya", State.FullBright, function(on)
     setFullBright(on)
 end)
 
-sectionLabel(utilityTab, "SCRIPT")
-createAction(utilityTab, "Refresh Scanner", "Force a role / ESP refresh", function()
+sectionLabel(utilityTab, "SYSTEM")
+createAction(utilityTab, "Refresh Scanner", "Force refresh role & item", function()
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
             Cache.Role[plr] = nil
@@ -1737,70 +1690,16 @@ createAction(utilityTab, "Refresh Scanner", "Force a role / ESP refresh", functi
     notify("Scanner refreshed.", Color3.fromRGB(105, 175, 255))
 end, Color3.fromRGB(105, 175, 255))
 
-createAction(utilityTab, "Unload Cleanly", "Restore changes + destroy UI", function()
-    if API.Unload then
-        API.Unload()
-    end
+createAction(utilityTab, "Unload Cleanly", "Hapus script & kembalikan setting", function()
+    if API.Unload then API.Unload() end
 end, Color3.fromRGB(255, 95, 110))
 
 --==============================================================
--- Runtime status
---==============================================================
-local function updateStatusUI()
-    if State.IsUnloaded then return end
-
-    local myRole = getRole(LocalPlayer, true)
-    local color = RoleColors[myRole] or RoleColors.Innocent
-
-    if StatusRoleLabel then
-        StatusRoleLabel.Text = "ROLE  •  " .. myRole:upper()
-        StatusRoleLabel.TextColor3 = color
-    end
-
-    if StatusInfoLabel then
-        local bits = {}
-        if State.RoleESP then table.insert(bits, "ESP") end
-        if State.AutoAim then table.insert(bits, "AUTO AIM") end
-        if State.Noclip then table.insert(bits, "NC") end
-        if State.AutoFarm then table.insert(bits, "FARM") end
-        if #bits == 0 then
-            StatusInfoLabel.Text = "STANDBY"
-        else
-            StatusInfoLabel.Text = table.concat(bits, "  •  ")
-        end
-    end
-end
-
-local function updateProximity()
-    if not ProximityAlertFrame or State.IsUnloaded or not State.ProximityRadar then
-        if ProximityAlertFrame then ProximityAlertFrame.Visible = false end
-        return
-    end
-
-    local root = getRoot(LocalPlayer.Character)
-    local murderer = getMurdererPlayer()
-    local mroot = murderer and getRoot(murderer.Character)
-
-    if root and mroot then
-        local distance = (root.Position - mroot.Position).Magnitude
-        if distance <= 35 then
-            ProximityAlertFrame.Visible = true
-            ProximityAlertLabel.Text = string.format("WARNING  •  %s  •  %d studs", murderer.DisplayName or murderer.Name, math.floor(distance))
-            return
-        end
-    end
-
-    ProximityAlertFrame.Visible = false
-end
-
---==============================================================
--- Drag helpers
+-- Drag Helper (FIXED: Compensates for UIScale on Mobile)
 --==============================================================
 local function makeDraggable(frame, handle)
     local dragging = false
-    local dragStart = nil
-    local startPos = nil
-    local dragInput = nil
+    local dragStart, startPos, dragInput
 
     handle.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -1822,18 +1721,18 @@ local function makeDraggable(frame, handle)
         end
     end)
 
-    local conn = UserInputService.InputChanged:Connect(function(input)
+    return UserInputService.InputChanged:Connect(function(input)
         if input == dragInput and dragging then
+            local currentScale = (UIScale and UIScale.Scale) or 1
             local delta = input.Position - dragStart
             frame.Position = UDim2.new(
                 startPos.X.Scale,
-                startPos.X.Offset + delta.X,
+                startPos.X.Offset + (delta.X / currentScale),
                 startPos.Y.Scale,
-                startPos.Y.Offset + delta.Y
+                startPos.Y.Offset + (delta.Y / currentScale)
             )
         end
     end)
-    return conn
 end
 
 Connections.MainDrag = makeDraggable(Main, Header)
@@ -1845,19 +1744,20 @@ local function setMenuVisible(visible)
 
     if visible then
         Main.Visible = true
-        Main.Position = UDim2.new(0.5, -160, 0.5, -172)
         tween(Main, TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
-            Position = UDim2.new(0.5, -160, 0.5, -182)
+            Position = UDim2.new(0.5, -185, 0.5, -217)
         })
     else
-        tween(Main, TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
-            Position = UDim2.new(0.5, -160, 0.5, -168)
+        local out = tween(Main, TweenInfo.new(0.16, Enum.EasingStyle.Quint, Enum.EasingDirection.In), {
+            Position = UDim2.new(0.5, -185, 0.5, -198)
         })
-        task.delay(0.16, function()
-            if not State.MenuOpen and Main then
-                Main.Visible = false
-            end
-        end)
+        if out then
+            out.Completed:Connect(function()
+                if not State.MenuOpen and Main then
+                    Main.Visible = false
+                end
+            end)
+        end
     end
 end
 
@@ -1869,15 +1769,14 @@ Close.MouseButton1Click:Connect(function()
     setMenuVisible(false)
 end)
 
-local keybindConn = UserInputService.InputBegan:Connect(function(input, processed)
+Connections.Keybind = UserInputService.InputBegan:Connect(function(input, processed)
     if processed or State.IsUnloaded then return end
     if input.KeyCode == Enum.KeyCode.RightShift or input.KeyCode == Enum.KeyCode.Insert then
         setMenuVisible(not State.MenuOpen)
     end
 end)
-Connections.Keybind = keybindConn
 
--- Responsive scale
+-- Responsive Scale
 local function updateScale()
     if not State.AutoScaleUI then
         UIScale.Scale = 1
@@ -1885,20 +1784,12 @@ local function updateScale()
     end
     Camera = Workspace.CurrentCamera or Camera
     if not Camera then return end
-
     local width = Camera.ViewportSize.X
-    local touchOnly = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
-    local scale
-    if touchOnly then
-        scale = math.clamp(width / 900, 0.62, 0.78)
-    else
-        scale = math.clamp(width / 1050, 0.78, 0.92)
-    end
-    UIScale.Scale = scale
+    UIScale.Scale = math.clamp(width / 420, 0.75, 1)
 end
 
 --==============================================================
--- Runtime connections
+-- Optimized Runtime Connections
 --==============================================================
 Connections.CharacterAdded = LocalPlayer.CharacterAdded:Connect(function()
     task.wait(0.6)
@@ -1907,12 +1798,18 @@ Connections.CharacterAdded = LocalPlayer.CharacterAdded:Connect(function()
     updateJumpPower()
 end)
 
+-- Performance Fix: Fast Noclip without deep scanning
 Connections.Noclip = RunService.Stepped:Connect(function()
     if State.IsUnloaded then return end
     if State.Noclip or State.AutoFarm then
-        setLocalCollision(false)
-    else
-        setLocalCollision(true)
+        local char = LocalPlayer.Character
+        if char then
+            for _, part in ipairs(char:GetChildren()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
     end
 end)
 
@@ -1953,8 +1850,8 @@ end)
 
 Connections.Render = RunService.RenderStepped:Connect(function()
     if State.IsUnloaded then return end
-    updateAutoAim()
     renderTracers()
+    runKnifeAura()
 end)
 
 Connections.Camera = Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
@@ -1963,12 +1860,12 @@ Connections.Camera = Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect
 end)
 
 --==============================================================
--- Scanner workers
+-- Background Worker Loops
 --==============================================================
+-- Scanner & UI Update
 task.spawn(function()
     while not State.IsUnloaded do
-        local players = Players:GetPlayers()
-        for _, plr in ipairs(players) do
+        for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= LocalPlayer and plr.Character then
                 if State.RoleESP then
                     local data = Cache.ESP[plr]
@@ -1978,7 +1875,7 @@ task.spawn(function()
                         local role = getRole(plr)
                         local color = RoleColors[role] or RoleColors.Innocent
                         data.Highlight.FillColor = color
-                        data.Highlight.OutlineColor = color:Lerp(Color3.new(1,1,1), 0.65)
+                        data.Highlight.OutlineColor = color:Lerp(Color3.new(1, 1, 1), 0.65)
                         if data.RoleText then
                             data.RoleText.Text = role:upper()
                             data.RoleText.TextColor3 = color
@@ -1994,51 +1891,82 @@ task.spawn(function()
 
         updateGunDropESP()
         updateTrapESP()
-        updateProximity()
-        updateStatusUI()
-        task.wait(0.55)
+
+        -- Proximity Warning
+        if State.ProximityRadar and ProximityAlertFrame then
+            local root = getRoot(LocalPlayer.Character)
+            local murderer = getMurdererPlayer()
+            local mroot = murderer and getRoot(murderer.Character)
+            if root and mroot then
+                local dist = (root.Position - mroot.Position).Magnitude
+                if dist <= 38 then
+                    ProximityAlertFrame.Visible = true
+                    ProximityAlertLabel.Text = string.format("WARNING  •  %s  •  %d studs", murderer.DisplayName or murderer.Name, math.floor(dist))
+                else
+                    ProximityAlertFrame.Visible = false
+                end
+            else
+                ProximityAlertFrame.Visible = false
+            end
+        end
+
+        -- Update Role Card
+        local myRole = getRole(LocalPlayer, true)
+        if StatusRoleLabel then
+            StatusRoleLabel.Text = "ROLE  •  " .. myRole:upper()
+            StatusRoleLabel.TextColor3 = RoleColors[myRole] or RoleColors.Innocent
+        end
+
+        task.wait(0.5)
     end
 end)
 
+-- Automation worker (Farming & Auto Grab)
 task.spawn(function()
     while not State.IsUnloaded do
+        if State.AutoGrabGun then
+            runAutoGrabGun()
+        end
         if State.AutoFarm then
             runFarmStep()
         end
-        task.wait(0.4)
+        task.wait(0.35)
     end
 end)
 
 task.spawn(function()
     while not State.IsUnloaded do
         updateScale()
-        task.wait(1.2)
+        task.wait(1.5)
     end
 end)
 
 --==============================================================
--- Unload
+-- Unload Routine
 --==============================================================
 function API.Unload()
     if State.IsUnloaded then return end
     State.IsUnloaded = true
 
     State.AutoFarm = false
+    State.AutoGrabGun = false
+    State.KnifeAura = false
     State.Noclip = false
-    State.AutoAim = false
+    State.SilentAim = false
     State.HitboxExpander = false
     State.Tracers = false
     stopFarmTween()
 
+    resetSpectate()
+    removeSkyPlatform()
     resetAllHitboxes()
     clearAllESP()
     clearTracers()
     clearGunESP()
     clearTrapESP()
-    setLocalCollision(true)
+
     for plr, conn in pairs(PlayerConnections) do
         pcall(function() conn:Disconnect() end)
-        PlayerConnections[plr] = nil
     end
     disconnectAll()
 
@@ -2057,14 +1985,14 @@ function API.Unload()
         GlobalEnv.LRN_MM2_ULTIMATE = nil
     end
 
-    print("[LRN] MM2 Ultimate V4 unloaded cleanly.")
+    print("[LRN] MM2 Ultimate V3.2 unloaded cleanly.")
 end
 
 API.State = State
 API.Notify = notify
 
 --==============================================================
--- Initial setup
+-- Initialization
 --==============================================================
 for _, plr in ipairs(Players:GetPlayers()) do
     if plr ~= LocalPlayer then
@@ -2073,10 +2001,18 @@ for _, plr in ipairs(Players:GetPlayers()) do
     end
 end
 
-switchTab("Visuals")
+-- Select default tab & configure start settings
+for name, frame in pairs(TabFrames) do
+    frame.Visible = (name == "Visuals")
+end
+for name, btn in pairs(TabButtons) do
+    local sel = (name == "Visuals")
+    btn.BackgroundColor3 = sel and Color3.fromRGB(42, 72, 132) or Color3.fromRGB(21, 24, 34)
+    btn.TextColor3 = sel and Color3.fromRGB(245, 248, 255) or Color3.fromRGB(135, 145, 164)
+end
+
 updateScale()
 updateWalkSpeed()
 updateJumpPower()
-notify("V4 loaded • mobile compact UI", Color3.fromRGB(95, 165, 255))
-
-print("[LRN] MM2 Ultimate V4 ready.")
+notify("LRN MM2 Ultimate V3.2 loaded.", Color3.fromRGB(95, 165, 255))
+print("[LRN] MM2 Ultimate V3.2 ready.")
